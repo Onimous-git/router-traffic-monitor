@@ -33,8 +33,8 @@ header() {
 }
 
 ask() {
-    printf "  ${BOLD}%s${NC} " "$1"
-    read -r REPLY
+    printf "  ${BOLD}%s${NC} " "$1" >/dev/tty
+    read -r REPLY </dev/tty
     echo "$REPLY"
 }
 
