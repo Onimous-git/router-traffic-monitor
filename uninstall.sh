@@ -26,8 +26,8 @@ printf "${NC}"
 echo ""
 printf "  ${BOLD}This will remove all installed files.${NC}\n"
 echo ""
-printf "  Are you sure? (y/n): "
-read -r CONFIRM
+printf "  Are you sure? (y/n): " >/dev/tty
+read -r CONFIRM </dev/tty
 [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ] || { echo "  Aborted."; exit 0; }
 echo ""
 
