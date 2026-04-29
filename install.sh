@@ -883,16 +883,11 @@ test_cgi() {
     echo ""
     OUTPUT=$(sh "$CGI_PATH" 2>&1)
     JSON=$(echo "$OUTPUT" | grep '^{')
-    if echo "$JSON" | grep -q '"ip"'; then
+    if echo "$JSON" | grep -q '"total"'; then
         ok "CGI output OK"
+        TOTAL=$(echo "$JSON" | grep -o '"total":[0-9]*' | cut -d: -f2)
+        info "Connected devices : $TOTAL"
         echo ""
-        echo "  $JSON" | tr ',' '\n' | sed 's/\[//' | sed 's/\]//' | while IFS= read -r dev; do
-            [ -z "$dev" ] && continue
-            IP=$(echo "$dev"  | grep -o '"ip":"[^"]*"'      | cut -d: -f2 | tr -d '"')
-            RX=$(echo "$dev"  | grep -o '"rxRate":[0-9]*'   | cut -d: -f2)
-            TX=$(echo "$dev"  | grep -o '"txRate":[0-9]*'   | cut -d: -f2)
-            printf "  %-18s  ↓ %-12s  ↑ %s\n" "$IP" "${RX} B/s" "${TX} B/s"
-        done
     else
         fail "CGI output unexpected:"
         echo "$OUTPUT"
