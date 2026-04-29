@@ -512,6 +512,7 @@ echo ""
 
 SNAP1=$(mktemp)
 SNAP2=$(mktemp)
+TOTAL_DEVICES=$(wc -l < /tmp/dhcp.leases)
 
 nft list table ip acct > "$SNAP1" &
 wait
@@ -525,7 +526,7 @@ T2=$(cut -d' ' -f1 /proc/uptime | tr -d '.')
 ELAPSED=$(( T2 - T1 ))
 [ "$ELAPSED" -lt 90 ] && ELAPSED=90
 
-awk -v elapsed="$ELAPSED" '
+awk -v elapsed="$ELAPSED" -v total="$TOTAL_DEVICES" '
 BEGIN {
     in_rx=0; in_tx=0; cur_ip=""
     while ((getline line < ARGV[1]) > 0) {
@@ -559,8 +560,8 @@ BEGIN {
         }
     }
     close(ARGV[2])
+    printf "{\"total\":%d,\"devices\":[", total+0
     first=1
-    printf "["
     for(ip in ips) {
         rx=(rx2[ip]-rx1[ip])*100/elapsed
         tx=(tx2[ip]-tx1[ip])*100/elapsed
@@ -570,7 +571,7 @@ BEGIN {
         printf "{\"ip\":\"%s\",\"rxRate\":%d,\"txRate\":%d}",ip,rx,tx
         first=0
     }
-    printf "]\n"
+    printf "]}\n"
 }
 ' "$SNAP1" "$SNAP2"
 
@@ -703,10 +704,11 @@ BEGIN {
 
 rm -f "\$SNAP1" "\$SNAP2"
 
-printf '['
+TOTAL_DEVICES=\$(wc -l < /tmp/dhcp.leases)
+printf '{"total":%d,"devices":[' "\$TOTAL_DEVICES"
 $JSON_FIRST
 $(printf "$JSON_REST")printf '%s' "\$WIFI_JSON"
-printf ']\n'
+printf ']}\n'
 CGEOF
     chmod +x "$CGI_PATH"
     ok "Installed: $CGI_PATH (hybrid/swconfig mode)"
@@ -825,10 +827,11 @@ BEGIN {
 
 rm -f "\$SNAP1" "\$SNAP2"
 
-printf '['
+TOTAL_DEVICES=\$(wc -l < /tmp/dhcp.leases)
+printf '{"total":%d,"devices":[' "\$TOTAL_DEVICES"
 $JSON_FIRST
 $(printf "$JSON_REST")printf '%s' "\$WIFI_JSON"
-printf ']\n'
+printf ']}\n'
 CGEOF
     chmod +x "$CGI_PATH"
     ok "Installed: $CGI_PATH (hybrid/DSA mode)"
@@ -879,7 +882,7 @@ test_cgi() {
     info "Running CGI (takes ~1 second)..."
     echo ""
     OUTPUT=$(sh "$CGI_PATH" 2>&1)
-    JSON=$(echo "$OUTPUT" | grep '^\[')
+    JSON=$(echo "$OUTPUT" | grep '^{')
     if echo "$JSON" | grep -q '"ip"'; then
         ok "CGI output OK"
         echo ""
