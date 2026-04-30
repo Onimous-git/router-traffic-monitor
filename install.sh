@@ -385,139 +385,125 @@ map_ports() {
     case "$SWITCH_TYPE" in
 
         swconfig)
-    info "Scanning switch ports via ARL table + MIB..."
-    echo ""
+            info "Building ARP + DHCP maps..."
+            rm -f /tmp/_rtm_arp.txt /tmp/_rtm_dhcp.txt \
+                  /tmp/_rtm_ports.txt /tmp/_rtm_portinfo.txt \
+                  /tmp/_rtm_active.txt
 
-    # Clean up any previous temp files
-    rm -f /tmp/_rtm_arp.txt /tmp/_rtm_dhcp.txt \
-          /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt
+            # MAC -> IP
+            arp -n | awk '
+                /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
+                    mac=tolower($3)
+                    if(mac!="" && mac!="<incomplete>")
+                        print mac " " $1
+                }' > /tmp/_rtm_arp.txt
 
-    # Build MAC→IP map from ARP
-    arp -n 2>/dev/null | awk '
-        /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
-            mac=tolower($3)
-            if(mac!="" && mac!="<incomplete>") print mac " " $1
-        }' > /tmp/_rtm_arp.txt
+            # MAC -> IP -> hostname (from leases: expiry MAC IP host)
+            awk '{print tolower($2) " " $3 " " $4}' \
+                /tmp/dhcp.leases > /tmp/_rtm_dhcp.txt
 
-    # Build MAC→IP→hostname map from DHCP leases
-    awk '{print tolower($2) " " $3 " " $4}' /tmp/dhcp.leases \
-        > /tmp/_rtm_dhcp.txt
+            info "Reading ARL table..."
+            swconfig dev "$SWITCH_DEV" get arl_table 2>/dev/null \
+                > /tmp/_rtm_arl.txt
 
-    # Dump ARL table to file — avoid pipe/subshell
-    swconfig dev "$SWITCH_DEV" get arl_table 2>/dev/null \
-        > /tmp/_rtm_arl.txt
+            # Parse: skip port 0 (CPU)
+            awk '
+                /^Port [0-9]+:/ {
+                    port=$2; gsub(":","",port)
+                    mac=tolower($4)
+                    if(port!="0" && mac!="")
+                        print port " " mac
+                }
+            ' /tmp/_rtm_arl.txt > /tmp/_rtm_ports.txt
 
-    # Debug: show raw ARL so we can verify parsing
-    info "Raw ARL table:"
-    cat /tmp/_rtm_arl.txt | while IFS= read -r line; do
-        printf "    %s\n" "$line"
-    done
-    echo ""
+            echo ""
+            printf "  %-8s %-20s %-18s %-20s %-15s %s\n" \
+                "Port" "Hostname" "IP" "MAC" "RxGoodByte" "TxByte"
+            printf "  %-8s %-20s %-18s %-20s %-15s %s\n" \
+                "────" "────────" "──" "───" "──────────" "──────"
 
-    # Parse ARL table with awk — write port:mac pairs to file
-    awk '
-        /^Port [0-9]+:.*MAC/ {
-            port=$2; gsub(":","",port)
-            mac=tolower($4)
-            if(port!="0" && mac!="") print port " " mac
-        }
-    ' /tmp/_rtm_arl.txt > /tmp/_rtm_ports.txt
+            # Use fd3 to avoid subshell — critical for busybox ash
+            while IFS=' ' read -r port mac <&3; do
+                [ -z "$port" ] && continue
 
-    # Debug: show parsed ports
-    info "Parsed port→MAC:"
-    cat /tmp/_rtm_ports.txt | while IFS= read -r line; do
-        printf "    %s\n" "$line"
-    done
-    echo ""
+                IP=$(awk   -v m="$mac" '$1==m{print $2;exit}' /tmp/_rtm_arp.txt)
+                HOST=$(awk -v m="$mac" '$1==m{print $3;exit}' /tmp/_rtm_dhcp.txt)
+                [ -z "$IP" ]   && IP="unknown"
+                [ -z "$HOST" ] && HOST="unknown"
 
-    # Now iterate line by line using a file read — no pipe, no subshell
-    echo "" > /tmp/_rtm_portinfo.txt
-    echo "" > /tmp/_rtm_active.txt
+                MIB=$(swconfig dev "$SWITCH_DEV" port "$port" get mib 2>/dev/null)
+                RX=$(printf '%s\n' "$MIB" | awk '/^RxGoodByte/{print $3+0}')
+                TX=$(printf '%s\n' "$MIB" | awk '/^TxByte/{print $3+0}')
+                RX=${RX:-0}
+                TX=${TX:-0}
 
-    while IFS=' ' read -r port mac <&3; do
-        [ -z "$port" ] && continue
+                printf "  %-8s %-20s %-18s %-20s %-15s %s\n" \
+                    "Port $port" "$HOST" "$IP" "$mac" "$RX" "$TX"
 
-        IP=$(awk  -v m="$mac" '$1==m{print $2;exit}' /tmp/_rtm_arp.txt)
-        HOST=$(awk -v m="$mac" '$1==m{print $3;exit}' /tmp/_rtm_dhcp.txt)
-        [ -z "$IP" ]   && IP="unknown"
-        [ -z "$HOST" ] && HOST="unknown"
+                printf '%s:%s:%s:%s\n' "$port" "$IP" "$HOST" "$mac" \
+                    >> /tmp/_rtm_portinfo.txt
 
-        MIB=$(swconfig dev "$SWITCH_DEV" port "$port" get mib 2>/dev/null)
-        RX=$(printf '%s' "$MIB" | awk '/^RxGoodByte/{print $3+0}')
-        TX=$(printf '%s' "$MIB" | awk '/^TxByte/{print $3+0}')
-        RX=${RX:-0}; TX=${TX:-0}
+                if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
+                    printf '%s\n' "$port" >> /tmp/_rtm_active.txt
+                fi
 
-        printf "  Port %-4s  %-18s  %-18s  %-20s  RX:%-15s TX:%s\n" \
-            "$port" "$mac" "$IP" "$HOST" "$RX" "$TX"
+            done 3< /tmp/_rtm_ports.txt
 
-        # Write to files — no subshell involved
-        printf '%s:%s:%s:%s\n' "$port" "$IP" "$HOST" "$mac" \
-            >> /tmp/_rtm_portinfo.txt
+            echo ""
 
-        if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
-            printf '%s\n' "$port" >> /tmp/_rtm_active.txt
-        fi
+            PORT_INFO=$(cat /tmp/_rtm_portinfo.txt 2>/dev/null | grep -v '^$')
+            ACTIVE_PORTS=$(cat /tmp/_rtm_active.txt 2>/dev/null \
+                           | grep -v '^$' | tr '\n' ' ')
 
-    done 3< /tmp/_rtm_ports.txt
+            rm -f /tmp/_rtm_arl.txt /tmp/_rtm_ports.txt \
+                  /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt \
+                  /tmp/_rtm_arp.txt /tmp/_rtm_dhcp.txt
 
-    echo ""
+            if [ -z "$(echo "$ACTIVE_PORTS" | tr -d ' ')" ]; then
+                warn "No active ports — using all detected ports"
+                ACTIVE_PORTS=$(printf '%s\n' "$PORT_INFO" \
+                               | cut -d: -f1 | tr '\n' ' ')
+            fi
 
-    # Read results back into variables
-    PORT_INFO=$(grep -v '^$' /tmp/_rtm_portinfo.txt 2>/dev/null)
-    ACTIVE_PORTS=$(grep -v '^$' /tmp/_rtm_active.txt 2>/dev/null \
-                  | tr '\n' ' ' | tr -s ' ')
+            echo ""
+            info "Map ports to device IPs."
+            info "Press Enter to confirm detected IP. Type new IP to override. 's' to skip."
+            echo ""
 
-    rm -f /tmp/_rtm_arl.txt /tmp/_rtm_ports.txt \
-          /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt
+            for port in $ACTIVE_PORTS; do
+                PINFO=$(printf '%s\n' "$PORT_INFO" | grep "^${port}:")
+                D_IP=$(printf '%s\n'   "$PINFO" | cut -d: -f2)
+                D_HOST=$(printf '%s\n' "$PINFO" | cut -d: -f3)
+                D_MAC=$(printf '%s\n'  "$PINFO" | cut -d: -f4)
 
-    if [ -z "$(echo "$ACTIVE_PORTS" | tr -d ' ')" ]; then
-        warn "No active ports — using all detected ports"
-        ACTIVE_PORTS=$(echo "$PORT_INFO" | cut -d: -f1 | tr '\n' ' ')
-    fi
+                if [ -n "$D_IP" ] && [ "$D_IP" != "unknown" ]; then
+                    printf "  ${BOLD}Port $port${NC} → ${CYAN}%s${NC} (%s) [%s]\n" \
+                        "$D_IP" "$D_HOST" "$D_MAC"
+                    IP=$(ask "  Confirm (Enter=$D_IP, new IP, or 's' to skip):")
+                    case "$IP" in
+                        s|S) continue ;;
+                        "")  IP="$D_IP" ;;
+                    esac
+                else
+                    printf "  ${BOLD}Port $port${NC} — no device detected\n"
+                    IP=$(ask "  Enter IP manually (or 's'/Enter to skip):")
+                    case "$IP" in
+                        s|S|"") continue ;;
+                    esac
+                fi
 
-    if [ -z "$(echo "$PORT_INFO" | tr -d ' ')" ]; then
-        warn "PORT_INFO empty — ARL parse failed, falling back to manual entry"
-        ACTIVE_PORTS="1 2 3 4"
-        PORT_INFO=""
-    fi
-
-    echo ""
-    info "Map ports to device IPs."
-    info "Press Enter to confirm detected IP. Type new IP to override. 's' to skip."
-    echo ""
-
-    for port in $ACTIVE_PORTS; do
-        PINFO=$(echo "$PORT_INFO" | grep "^$port:")
-        DETECTED_IP=$(echo "$PINFO"   | cut -d: -f2)
-        DETECTED_HOST=$(echo "$PINFO" | cut -d: -f3)
-        DETECTED_MAC=$(echo "$PINFO"  | cut -d: -f4)
-
-        if [ -n "$DETECTED_IP" ] && [ "$DETECTED_IP" != "unknown" ]; then
-            printf "  ${BOLD}Port $port${NC} → ${CYAN}%s${NC} (%s) [%s]\n" \
-                "$DETECTED_IP" "$DETECTED_HOST" "$DETECTED_MAC"
-            IP=$(ask "  Confirm (Enter=$DETECTED_IP, new IP, or 's' to skip):")
-            case "$IP" in
-                s|S) continue ;;
-                "")  IP="$DETECTED_IP" ;;
-            esac
-        else
-            printf "  ${BOLD}Port $port${NC} — no device detected\n"
-            IP=$(ask "  Enter IP manually (or 's'/Enter to skip):")
-            case "$IP" in
-                s|S|"") continue ;;
-            esac
-        fi
-
-        MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
-        ok "Port $port → $IP"
-    done
-;;
+                MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
+                ok "Port $port → $IP"
+            done
+        ;;
 
         dsa|ethtool)
             info "Scanning LAN interfaces for traffic..."
             echo ""
-            printf "  %-12s %-20s %-20s %s\n" "Interface" "RX bytes" "TX bytes" "Status"
-            printf "  %-12s %-20s %-20s %s\n" "─────────" "────────" "────────" "──────"
+            printf "  %-12s %-20s %-20s %s\n" \
+                "Interface" "RX bytes" "TX bytes" "Status"
+            printf "  %-12s %-20s %-20s %s\n" \
+                "─────────" "────────" "────────" "──────"
             ACTIVE_IFACES=""
             for iface in $DSA_PORTS; do
                 RX=$(cat /sys/class/net/$iface/statistics/rx_bytes 2>/dev/null || echo 0)
@@ -528,7 +514,8 @@ map_ports() {
                 else
                     STATUS="idle"
                 fi
-                printf "  %-12s %-20s %-20s %s\n" "$iface" "$RX" "$TX" "$STATUS"
+                printf "  %-12s %-20s %-20s %s\n" \
+                    "$iface" "$RX" "$TX" "$STATUS"
             done
             echo ""
             info "Map active interfaces to device IPs."
@@ -541,7 +528,8 @@ map_ports() {
                     ok "$iface mapped to $IP"
                 fi
             done
-            ;;
+        ;;
+
     esac
 
     if [ -z "$MAPPED_PORTS" ]; then
