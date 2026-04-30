@@ -54,7 +54,7 @@ MAPPED_PORTS=""
 preflight_checks() {
     header "Router Traffic Monitor — Pre-flight Check"
     FAIL=0
-
+    
     echo ""
     echo "  Checking OpenWrt version..."
     if [ -f /etc/openwrt_release ]; then
@@ -64,7 +64,7 @@ preflight_checks() {
         info "Detected  : OpenWrt $DISTRIB_RELEASE ($DISTRIB_ARCH)"
         info "Required  : $MIN_OPENWRT_MAJOR.$MIN_OPENWRT_MINOR or newer"
         if [ "$MAJOR" -gt "$MIN_OPENWRT_MAJOR" ] || \
-           { [ "$MAJOR" -eq "$MIN_OPENWRT_MAJOR" ] && [ "$MINOR" -ge "$MIN_OPENWRT_MINOR" ]; }; then
+        { [ "$MAJOR" -eq "$MIN_OPENWRT_MAJOR" ] && [ "$MINOR" -ge "$MIN_OPENWRT_MINOR" ]; }; then
             ok "Version OK"
         else
             fail "Version UNSUPPORTED"
@@ -86,7 +86,7 @@ preflight_checks() {
         fail "Cannot detect OpenWrt version"
         FAIL=1
     fi
-
+    
     echo ""
     echo "  Checking flash space..."
     FLASH_KB=$(df /overlay 2>/dev/null | awk 'NR==2{print int($4/1)}')
@@ -98,7 +98,7 @@ preflight_checks() {
         fail "Insufficient flash space — only ${FLASH_KB}KB free"
         FAIL=1
     fi
-
+    
     echo ""
     echo "  Checking RAM..."
     RAM_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
@@ -109,7 +109,7 @@ preflight_checks() {
         fail "Insufficient RAM"
         FAIL=1
     fi
-
+    
     echo ""
     printf "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
     if [ "$FAIL" = "1" ]; then
@@ -128,7 +128,7 @@ preflight_checks() {
 detect_switch() {
     header "Detecting Switch Type"
     echo ""
-
+    
     # 1. swconfig
     if command -v swconfig >/dev/null 2>&1; then
         SWITCH_DEV=$(swconfig list 2>/dev/null | awk 'NR==1{print $1}')
@@ -139,7 +139,7 @@ detect_switch() {
             return
         fi
     fi
-
+    
     # 2. DSA
     echo "  swconfig not found, checking for DSA..."
     DSA_PORTS=""
@@ -165,7 +165,7 @@ detect_switch() {
         HYBRID_AVAILABLE=1
         return
     fi
-
+    
     # 3. ethtool fallback
     echo "  DSA not detected, checking ethtool..."
     if command -v ethtool >/dev/null 2>&1; then
@@ -182,7 +182,7 @@ detect_switch() {
             fi
         done
     fi
-
+    
     # 4. None
     SWITCH_TYPE="none"
     warn "No managed switch detected"
@@ -197,7 +197,7 @@ check_deps() {
     header "Checking Dependencies"
     echo ""
     OPKG_UPDATED=0
-
+    
     install_pkg() {
         PKG="$1"
         REASON="$2"
@@ -228,10 +228,10 @@ check_deps() {
             exit 1
         fi
     }
-
+    
     install_pkg "nftables" "WiFi device auto-detection"
     install_pkg "uhttpd"   "Serving CGI to ESP32"
-
+    
     printf "  Checking %-20s ... " "awk"
     if command -v awk >/dev/null 2>&1; then
         printf "${GREEN}installed${NC}\n"
@@ -239,18 +239,18 @@ check_deps() {
         printf "${RED}missing${NC}\n"
         install_pkg "gawk" "CGI data parsing"
     fi
-
+    
     if [ "$SWITCH_TYPE" = "swconfig" ]; then
         install_pkg "swconfig" "Ethernet port MIB counters"
     fi
-
+    
     if [ "$SWITCH_TYPE" = "dsa" ]; then
         printf "  Checking %-20s ... " "bridge"
         command -v bridge >/dev/null 2>&1 && \
-            printf "${GREEN}installed${NC}\n" || \
-            install_pkg "bridge-utils" "DSA interface detection"
+        printf "${GREEN}installed${NC}\n" || \
+        install_pkg "bridge-utils" "DSA interface detection"
     fi
-
+    
     echo ""
     ok "All dependencies satisfied"
 }
@@ -261,10 +261,10 @@ check_deps() {
 detect_network() {
     header "Detecting Network"
     echo ""
-
+    
     LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
     LAN_MASK=$(uci get network.lan.netmask 2>/dev/null)
-
+    
     IFS=. read -r i1 i2 i3 i4 << EOF
 $LAN_IP
 EOF
@@ -286,7 +286,7 @@ EOF
         esac
     done
     LAN_CIDR="$LAN_SUBNET/$PREFIX"
-
+    
     info "Router LAN IP : $LAN_IP"
     info "LAN Subnet    : $LAN_CIDR"
     echo ""
@@ -299,14 +299,14 @@ EOF
 select_mode() {
     header "Select Installation Mode"
     echo ""
-
+    
     if [ "$HYBRID_AVAILABLE" = "0" ]; then
         warn "No managed switch detected on this router."
         info "Installing in Auto mode (WiFi + internet traffic only)"
         MODE="auto"
         return
     fi
-
+    
     printf "  ${BOLD}1)${NC} Hybrid — Ethernet (MIB/sysfs) + WiFi (nft)\n"
     printf "     Full LAN-to-LAN traffic visibility for ethernet devices\n"
     printf "     Ethernet devices must be mapped manually during setup\n"
@@ -330,10 +330,10 @@ select_mode() {
 # ══════════════════════════════════════════════════════════════
 map_ports() {
     [ "$MODE" = "auto" ] && return
-
+    
     header "Ethernet Port Mapping"
     echo ""
-
+    
     # Show connected devices
     if [ -s /tmp/dhcp.leases ]; then
         info "Connected devices (from DHCP leases):"
@@ -354,23 +354,24 @@ map_ports() {
         awk 'NR>1 && $3=="0x2" && $7~/br-lan/ {printf "  %-18s %s\n", $1, $4}' /proc/net/arp
     fi
     echo ""
-
+    
     MAPPED_PORTS=""
-
+    
     case "$SWITCH_TYPE" in
         swconfig)
             info "Scanning ALL switch ports (including idle)..."
             echo ""
             printf "  %-8s %-20s %-20s %s\n" "Port" "RxGoodByte" "TxByte" "Status"
             printf "  %-8s %-20s %-20s %s\n" "────" "──────────" "──────" "──────"
-
+            
             ALL_PORTS=""
+            TMPDIR=$(mktemp -d)
             i=0
             while [ $i -le 6 ]; do
-                MIB=$(swconfig dev "$SWITCH_DEV" port $i get mib 2>/dev/null)
-                if [ -n "$MIB" ]; then
-                    RX=$(echo "$MIB" | awk '/RxGoodByte/{print $3+0}')
-                    TX=$(echo "$MIB" | awk '/TxByte/{print $3+0}')
+                swconfig dev "$SWITCH_DEV" port $i get mib > "$TMPDIR/p$i" 2>/dev/null
+                if grep -q "RxGoodByte" "$TMPDIR/p$i" 2>/dev/null; then
+                    RX=$(awk '/RxGoodByte/{print $3+0}' "$TMPDIR/p$i")
+                    TX=$(awk '/TxByte/{print $3+0}'     "$TMPDIR/p$i")
                     RX=${RX:-0}
                     TX=${TX:-0}
                     if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
@@ -383,19 +384,20 @@ map_ports() {
                 fi
                 i=$((i+1))
             done
-
+            rm -rf "$TMPDIR"
+            
             if [ -z "$ALL_PORTS" ]; then
                 warn "No switch ports found. Check swconfig device name."
                 warn "Switching to Auto mode."
                 MODE="auto"
                 return
             fi
-
+            
             echo ""
             info "Map ports to device IPs (Enter to skip a port)."
             info "Tip: generate traffic on a device to identify its port."
             echo ""
-
+            
             for port in $ALL_PORTS; do
                 IP=$(ask "  Port $port → IP address (or Enter to skip):")
                 if [ -n "$IP" ]; then
@@ -405,14 +407,14 @@ map_ports() {
                     info "Port $port skipped"
                 fi
             done
-            ;;
-
+        ;;
+        
         dsa|ethtool)
             info "Scanning LAN interfaces..."
             echo ""
             printf "  %-12s %-20s %-20s %s\n" "Interface" "RX bytes" "TX bytes" "Status"
             printf "  %-12s %-20s %-20s %s\n" "─────────" "────────" "────────" "──────"
-
+            
             for iface in $DSA_PORTS; do
                 RX=$(cat /sys/class/net/$iface/statistics/rx_bytes 2>/dev/null || echo 0)
                 TX=$(cat /sys/class/net/$iface/statistics/tx_bytes 2>/dev/null || echo 0)
@@ -423,11 +425,11 @@ map_ports() {
                 fi
                 printf "  %-12s %-20s %-20s %s\n" "$iface" "$RX" "$TX" "$STATUS"
             done
-
+            
             echo ""
             info "Map interfaces to device IPs (Enter to skip)."
             echo ""
-
+            
             for iface in $DSA_PORTS; do
                 IP=$(ask "  $iface → IP address (or Enter to skip):")
                 if [ -n "$IP" ]; then
@@ -437,9 +439,9 @@ map_ports() {
                     info "$iface skipped"
                 fi
             done
-            ;;
+        ;;
     esac
-
+    
     if [ -z "$MAPPED_PORTS" ]; then
         echo ""
         warn "No ports mapped."
@@ -582,12 +584,12 @@ install_cgi_hybrid_swconfig() {
     JSON_REST=""
     SKIP_IPS=""
     IDX=0
-
+    
     for entry in $MAPPED_PORTS; do
         PORT=$(echo "$entry" | cut -d: -f1)
         IP=$(echo "$entry"   | cut -d: -f2)
         VAR="P${IDX}"
-
+        
         SNAP1_CMDS="${SNAP1_CMDS}swconfig dev $SWITCH_DEV port $PORT get mib > \"\$T/${VAR}s1\" &\n"
         SNAP2_CMDS="${SNAP2_CMDS}swconfig dev $SWITCH_DEV port $PORT get mib > \"\$T/${VAR}s2\" &\n"
         READ1_CMDS="${READ1_CMDS}${VAR}_PRXI=\$(awk '/RxGoodByte/{print \$3+0}' \"\$T/${VAR}s1\")\n"
@@ -598,13 +600,13 @@ install_cgi_hybrid_swconfig() {
         RATE_CMDS="${RATE_CMDS}${VAR}_TX=\$(( (\${${VAR}_PRXF} - \${${VAR}_PRXI}) * 100 / ELAPSED ))\n"
         RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_RX}\" -lt 0 ] && ${VAR}_RX=0\n"
         RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_TX}\" -lt 0 ] && ${VAR}_TX=0\n"
-
+        
         if [ -z "$JSON_FIRST" ]; then
             JSON_FIRST="printf '{\"ip\":\"$IP\",\"rxRate\":%d,\"txRate\":%d}' \"\$${VAR}_RX\" \"\$${VAR}_TX\""
         else
             JSON_REST="${JSON_REST}printf ',{\"ip\":\"$IP\",\"rxRate\":%d,\"txRate\":%d}' \"\$${VAR}_RX\" \"\$${VAR}_TX\"\n"
         fi
-
+        
         if [ -z "$SKIP_IPS" ]; then
             SKIP_IPS="ip == \"$IP\""
         else
@@ -612,7 +614,7 @@ install_cgi_hybrid_swconfig() {
         fi
         IDX=$((IDX+1))
     done
-
+    
     cat > "$CGI_PATH" << CGEOF
 #!/bin/sh
 echo "Content-Type: application/json"
@@ -710,12 +712,12 @@ install_cgi_hybrid_dsa() {
     JSON_REST=""
     SKIP_IPS=""
     IDX=0
-
+    
     for entry in $MAPPED_PORTS; do
         IFACE=$(echo "$entry" | cut -d: -f1)
         IP=$(echo "$entry"    | cut -d: -f2)
         VAR="P${IDX}"
-
+        
         SNAP1_CMDS="${SNAP1_CMDS}${VAR}_RXI=\$(cat /sys/class/net/$IFACE/statistics/rx_bytes)\n"
         SNAP1_CMDS="${SNAP1_CMDS}${VAR}_TXI=\$(cat /sys/class/net/$IFACE/statistics/tx_bytes)\n"
         SNAP2_CMDS="${SNAP2_CMDS}${VAR}_RXF=\$(cat /sys/class/net/$IFACE/statistics/rx_bytes)\n"
@@ -724,13 +726,13 @@ install_cgi_hybrid_dsa() {
         RATE_CMDS="${RATE_CMDS}${VAR}_TX=\$(( (\${${VAR}_TXF} - \${${VAR}_TXI}) * 100 / ELAPSED ))\n"
         RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_RX}\" -lt 0 ] && ${VAR}_RX=0\n"
         RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_TX}\" -lt 0 ] && ${VAR}_TX=0\n"
-
+        
         if [ -z "$JSON_FIRST" ]; then
             JSON_FIRST="printf '{\"ip\":\"$IP\",\"rxRate\":%d,\"txRate\":%d}' \"\$${VAR}_RX\" \"\$${VAR}_TX\""
         else
             JSON_REST="${JSON_REST}printf ',{\"ip\":\"$IP\",\"rxRate\":%d,\"txRate\":%d}' \"\$${VAR}_RX\" \"\$${VAR}_TX\"\n"
         fi
-
+        
         if [ -z "$SKIP_IPS" ]; then
             SKIP_IPS="ip == \"$IP\""
         else
@@ -738,7 +740,7 @@ install_cgi_hybrid_dsa() {
         fi
         IDX=$((IDX+1))
     done
-
+    
     cat > "$CGI_PATH" << CGEOF
 #!/bin/sh
 echo "Content-Type: application/json"
@@ -828,7 +830,7 @@ install_files() {
     echo ""
     install_nft
     install_hotplug
-
+    
     case "$MODE" in
         auto) install_cgi_auto ;;
         hybrid)
@@ -836,9 +838,9 @@ install_files() {
                 swconfig)    install_cgi_hybrid_swconfig ;;
                 dsa|ethtool) install_cgi_hybrid_dsa ;;
             esac
-            ;;
+        ;;
     esac
-
+    
     echo ""
     info "Loading nft table..."
     nft list table ip acct >/dev/null 2>&1 && nft delete table ip acct
@@ -848,7 +850,7 @@ install_files() {
         fail "nft table failed to load"
         exit 1
     fi
-
+    
     echo ""
     info "Verifying firewall masquerade intact..."
     if nft list ruleset | grep -q "masquerade"; then
@@ -917,7 +919,7 @@ main() {
     echo "  ╚═══════════════════════════════════════════════════╝"
     printf "${NC}"
     echo ""
-
+    
     preflight_checks
     detect_switch
     check_deps
