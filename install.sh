@@ -49,7 +49,7 @@ MODE=""
 OPENWRT_VERSION=""
 NFT_OK=0
 HYBRID_AVAILABLE=0
-declare_ports() { MAPPED_PORTS=""; }
+MAPPED_PORTS=""
 
 # ══════════════════════════════════════════════════════════════
 #  STEP 1 — PRE-FLIGHT CHECKS
@@ -69,7 +69,7 @@ preflight_checks() {
         info "Detected  : OpenWrt $DISTRIB_RELEASE ($DISTRIB_ARCH)"
         info "Required  : $MIN_OPENWRT_MAJOR.$MIN_OPENWRT_MINOR or newer"
         if [ "$MAJOR" -gt "$MIN_OPENWRT_MAJOR" ] || \
-           { [ "$MAJOR" -eq "$MIN_OPENWRT_MAJOR" ] && [ "$MINOR" -ge "$MIN_OPENWRT_MINOR" ]; }; then
+        { [ "$MAJOR" -eq "$MIN_OPENWRT_MAJOR" ] && [ "$MINOR" -ge "$MIN_OPENWRT_MINOR" ]; }; then
             ok "Version OK"
         else
             fail "Version UNSUPPORTED"
@@ -154,10 +154,13 @@ detect_switch() {
     if command -v swconfig >/dev/null 2>&1; then
         SWITCH_DEV=$(swconfig list 2>/dev/null | awk 'NR==1{print $1}')
         if [ -n "$SWITCH_DEV" ]; then
-            SWITCH_TYPE="swconfig"
-            ok "Switch type : swconfig ($SWITCH_DEV)"
-            HYBRID_AVAILABLE=1
-            return
+            # Verify it actually responds
+            if swconfig dev "$SWITCH_DEV" help >/dev/null 2>&1; then
+                SWITCH_TYPE="swconfig"
+                ok "Switch type : swconfig ($SWITCH_DEV)"
+                HYBRID_AVAILABLE=1
+                return
+            fi
         fi
     fi
 
@@ -170,7 +173,6 @@ detect_switch() {
             br-*|lo|wlan*|wifi*|ath*|radio*|mon*) continue ;;
         esac
         if [ -f "$iface/statistics/rx_bytes" ]; then
-            # Check if part of br-lan bridge
             IN_BRIDGE=0
             brctl show br-lan 2>/dev/null | grep -q "^[[:space:]]*$name" && IN_BRIDGE=1
             bridge link 2>/dev/null | grep -q " $name " && IN_BRIDGE=1
@@ -255,11 +257,9 @@ check_deps() {
         fi
     }
 
-    # Core dependencies
-    install_pkg "nftables"    "WiFi device auto-detection"
-    install_pkg "uhttpd"      "Serving CGI to ESP32"
+    install_pkg "nftables" "WiFi device auto-detection"
+    install_pkg "uhttpd"   "Serving CGI to ESP32"
 
-    # awk is busybox built-in — just verify
     printf "  Checking %-20s ... " "awk"
     if command -v awk >/dev/null 2>&1; then
         printf "${GREEN}installed${NC}\n"
@@ -269,17 +269,15 @@ check_deps() {
         install_pkg "gawk" "CGI data parsing"
     fi
 
-    # swconfig only if needed
     if [ "$SWITCH_TYPE" = "swconfig" ]; then
         install_pkg "swconfig" "Ethernet port MIB counters"
     fi
 
-    # bridge-utils for DSA detection
     if [ "$SWITCH_TYPE" = "dsa" ]; then
         printf "  Checking %-20s ... " "bridge"
         command -v bridge >/dev/null 2>&1 && \
-            printf "${GREEN}installed${NC}\n" || \
-            install_pkg "bridge-utils" "DSA interface detection"
+        printf "${GREEN}installed${NC}\n" || \
+        install_pkg "bridge-utils" "DSA interface detection"
     fi
 
     echo ""
@@ -297,7 +295,6 @@ detect_network() {
     LAN_MASK=$(uci get network.lan.netmask 2>/dev/null)
     LAN_DEV=$(uci get network.lan.device 2>/dev/null)
 
-    # Calculate subnet from IP and mask
     IFS=. read -r i1 i2 i3 i4 << EOF
 $LAN_IP
 EOF
@@ -305,7 +302,6 @@ EOF
 $LAN_MASK
 EOF
     LAN_SUBNET="$(( i1 & m1 )).$(( i2 & m2 )).$(( i3 & m3 )).$(( i4 & m4 ))"
-    # Get prefix length
     PREFIX=0
     for m in $m1 $m2 $m3 $m4; do
         case $m in
@@ -387,18 +383,23 @@ map_ports() {
         swconfig)
             info "Building ARP + DHCP maps..."
             rm -f /tmp/_rtm_arp.txt /tmp/_rtm_dhcp.txt \
-                  /tmp/_rtm_ports.txt /tmp/_rtm_portinfo.txt \
-                  /tmp/_rtm_active.txt
+                  /tmp/_rtm_arl.txt /tmp/_rtm_ports.txt \
+                  /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt
 
-            # MAC -> IP
+            # MAC -> IP — scan all fields for MAC pattern (busybox arp -n
+            # puts MAC in col 4, standard puts it in col 3)
             arp -n | awk '
                 /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
-                    mac=tolower($3)
-                    if(mac!="" && mac!="<incomplete>")
-                        print mac " " $1
+                    for(i=2;i<=NF;i++) {
+                        if($i~/^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/) {
+                            print tolower($i) " " $1
+                            break
+                        }
+                    }
                 }' > /tmp/_rtm_arp.txt
 
-            # MAC -> IP -> hostname (from leases: expiry MAC IP host)
+            # MAC -> IP -> hostname from DHCP leases
+            # lease format: expiry MAC IP hostname ...
             awk '{print tolower($2) " " $3 " " $4}' \
                 /tmp/dhcp.leases > /tmp/_rtm_dhcp.txt
 
@@ -406,13 +407,12 @@ map_ports() {
             swconfig dev "$SWITCH_DEV" get arl_table 2>/dev/null \
                 > /tmp/_rtm_arl.txt
 
-            # Parse: skip port 0 (CPU)
+            # Parse port→MAC, skip CPU port 0
             awk '
                 /^Port [0-9]+:/ {
                     port=$2; gsub(":","",port)
                     mac=tolower($4)
-                    if(port!="0" && mac!="")
-                        print port " " mac
+                    if(port!="0" && mac!="") print port " " mac
                 }
             ' /tmp/_rtm_arl.txt > /tmp/_rtm_ports.txt
 
@@ -422,7 +422,7 @@ map_ports() {
             printf "  %-8s %-20s %-18s %-20s %-15s %s\n" \
                 "────" "────────" "──" "───" "──────────" "──────"
 
-            # Use fd3 to avoid subshell — critical for busybox ash
+            # fd3 redirect avoids subshell — variables persist after loop
             while IFS=' ' read -r port mac <&3; do
                 [ -z "$port" ] && continue
 
@@ -451,9 +451,9 @@ map_ports() {
 
             echo ""
 
-            PORT_INFO=$(cat /tmp/_rtm_portinfo.txt 2>/dev/null | grep -v '^$')
-            ACTIVE_PORTS=$(cat /tmp/_rtm_active.txt 2>/dev/null \
-                           | grep -v '^$' | tr '\n' ' ')
+            PORT_INFO=$(grep -v '^$' /tmp/_rtm_portinfo.txt 2>/dev/null)
+            ACTIVE_PORTS=$(grep -v '^$' /tmp/_rtm_active.txt 2>/dev/null \
+                           | tr '\n' ' ')
 
             rm -f /tmp/_rtm_arl.txt /tmp/_rtm_ports.txt \
                   /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt \
@@ -485,7 +485,8 @@ map_ports() {
                         "")  IP="$D_IP" ;;
                     esac
                 else
-                    printf "  ${BOLD}Port $port${NC} — no device detected\n"
+                    printf "  ${BOLD}Port $port${NC} (%s) [%s] — IP not in ARP table\n" \
+                        "$D_HOST" "$D_MAC"
                     IP=$(ask "  Enter IP manually (or 's'/Enter to skip):")
                     case "$IP" in
                         s|S|"") continue ;;
@@ -542,7 +543,6 @@ map_ports() {
 #  STEP 7 — GENERATE & INSTALL FILES
 # ══════════════════════════════════════════════════════════════
 
-# ── Generate nft-acct.nft ─────────────────────────────────────
 install_nft() {
     cat > "$NFT_PATH" << EOF
 table ip acct {
@@ -569,7 +569,6 @@ EOF
     ok "Installed: $NFT_PATH"
 }
 
-# ── Generate hotplug script ───────────────────────────────────
 install_hotplug() {
     cat > "$HOTPLUG_PATH" << 'EOF'
 #!/bin/sh
@@ -584,7 +583,6 @@ EOF
     ok "Installed: $HOTPLUG_PATH"
 }
 
-# ── Generate auto CGI ─────────────────────────────────────────
 install_cgi_auto() {
     cat > "$CGI_PATH" << 'CGEOF'
 #!/bin/sh
@@ -596,13 +594,10 @@ SNAP1=$(mktemp)
 SNAP2=$(mktemp)
 TOTAL_DEVICES=$(wc -l < /tmp/dhcp.leases)
 
-nft list table ip acct > "$SNAP1" &
-wait
-
+nft list table ip acct > "$SNAP1"
 T1=$(cut -d' ' -f1 /proc/uptime | tr -d '.')
 sleep 1
-nft list table ip acct > "$SNAP2" &
-wait
+nft list table ip acct > "$SNAP2"
 T2=$(cut -d' ' -f1 /proc/uptime | tr -d '.')
 
 ELAPSED=$(( T2 - T1 ))
@@ -663,9 +658,7 @@ CGEOF
     ok "Installed: $CGI_PATH (auto mode)"
 }
 
-# ── Generate hybrid CGI (swconfig) ───────────────────────────
 install_cgi_hybrid_swconfig() {
-    # Build MIB snapshot blocks dynamically
     SNAP1_CMDS=""
     SNAP2_CMDS=""
     READ1_CMDS=""
@@ -683,10 +676,10 @@ install_cgi_hybrid_swconfig() {
 
         SNAP1_CMDS="${SNAP1_CMDS}swconfig dev $SWITCH_DEV port $PORT get mib > \"\$T/${VAR}s1\" &\n"
         SNAP2_CMDS="${SNAP2_CMDS}swconfig dev $SWITCH_DEV port $PORT get mib > \"\$T/${VAR}s2\" &\n"
-        READ1_CMDS="${READ1_CMDS}${VAR}_PRXI=\$(awk '/RxGoodByte/{print \$3+0}' \"\$T/${VAR}s1\")\n"
-        READ1_CMDS="${READ1_CMDS}${VAR}_PTXI=\$(awk '/TxByte/{print \$3+0}'     \"\$T/${VAR}s1\")\n"
-        READ2_CMDS="${READ2_CMDS}${VAR}_PRXF=\$(awk '/RxGoodByte/{print \$3+0}' \"\$T/${VAR}s2\")\n"
-        READ2_CMDS="${READ2_CMDS}${VAR}_PTXF=\$(awk '/TxByte/{print \$3+0}'     \"\$T/${VAR}s2\")\n"
+        READ1_CMDS="${READ1_CMDS}${VAR}_PRXI=\$(awk '/^RxGoodByte/{print \$3+0}' \"\$T/${VAR}s1\")\n"
+        READ1_CMDS="${READ1_CMDS}${VAR}_PTXI=\$(awk '/^TxByte/{print \$3+0}'     \"\$T/${VAR}s1\")\n"
+        READ2_CMDS="${READ2_CMDS}${VAR}_PRXF=\$(awk '/^RxGoodByte/{print \$3+0}' \"\$T/${VAR}s2\")\n"
+        READ2_CMDS="${READ2_CMDS}${VAR}_PTXF=\$(awk '/^TxByte/{print \$3+0}'     \"\$T/${VAR}s2\")\n"
         RATE_CMDS="${RATE_CMDS}${VAR}_RX=\$(( (\$\{${VAR}_PTXF\} - \$\{${VAR}_PTXI\}) * 100 / ELAPSED ))\n"
         RATE_CMDS="${RATE_CMDS}${VAR}_TX=\$(( (\$\{${VAR}_PRXF\} - \$\{${VAR}_PRXI\}) * 100 / ELAPSED ))\n"
         RATE_CMDS="${RATE_CMDS}[ \"\$\{${VAR}_RX\}\" -lt 0 ] && ${VAR}_RX=0\n"
@@ -717,8 +710,7 @@ SNAP1=\$(mktemp)
 SNAP2=\$(mktemp)
 
 # Snapshot 1
-$(printf "$SNAP1_CMDS")swconfig dev $SWITCH_DEV show > /dev/null &
-nft list table ip acct > "\$SNAP1" &
+$(printf "$SNAP1_CMDS")nft list table ip acct > "\$SNAP1" &
 wait
 
 $(printf "$READ1_CMDS")
@@ -738,7 +730,6 @@ ELAPSED=\$(( T2 - T1 ))
 
 $(printf "$RATE_CMDS")
 
-# WiFi via nft
 WIFI_JSON=\$(awk -v elapsed="\$ELAPSED" '
 BEGIN {
     in_rx=0; in_tx=0; cur_ip=""
@@ -796,7 +787,6 @@ CGEOF
     ok "Installed: $CGI_PATH (hybrid/swconfig mode)"
 }
 
-# ── Generate hybrid CGI (DSA/sysfs) ──────────────────────────
 install_cgi_hybrid_dsa() {
     SNAP1_CMDS=""
     SNAP2_CMDS=""
@@ -861,7 +851,6 @@ ELAPSED=\$(( T2 - T1 ))
 
 $(printf "$RATE_CMDS")
 
-# WiFi via nft
 WIFI_JSON=\$(awk -v elapsed="\$ELAPSED" '
 BEGIN {
     in_rx=0; in_tx=0; cur_ip=""
@@ -930,10 +919,10 @@ install_files() {
         auto) install_cgi_auto ;;
         hybrid)
             case "$SWITCH_TYPE" in
-                swconfig)        install_cgi_hybrid_swconfig ;;
-                dsa|ethtool)     install_cgi_hybrid_dsa ;;
+                swconfig)    install_cgi_hybrid_swconfig ;;
+                dsa|ethtool) install_cgi_hybrid_dsa ;;
             esac
-            ;;
+        ;;
     esac
 
     echo ""
