@@ -385,40 +385,68 @@ map_ports() {
     case "$SWITCH_TYPE" in
 
         swconfig)
-            info "Scanning switch ports for traffic..."
-            echo ""
-            printf "  %-8s %-20s %-20s %s\n" "Port" "RxGoodByte" "TxByte" "Status"
-            printf "  %-8s %-20s %-20s %s\n" "────" "──────────" "──────" "──────"
-            ACTIVE_PORTS=""
-            i=0
-            while [ $i -le 6 ]; do
-                MIB=$(swconfig dev "$SWITCH_DEV" port $i get mib 2>/dev/null)
-                RX=$(echo "$MIB" | awk '/RxGoodByte/{print $3+0}')
-                TX=$(echo "$MIB" | awk '/TxByte/{print $3+0}')
-                if [ -n "$RX" ]; then
-                    if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
-                        STATUS="active"
-                        ACTIVE_PORTS="$ACTIVE_PORTS $i"
-                    else
-                        STATUS="idle (0 traffic)"
-                        ACTIVE_PORTS="$ACTIVE_PORTS $i"
-                    fi
-                    printf "  %-8s %-20s %-20s %s\n" "Port $i" "$RX" "$TX" "$STATUS"
-                fi
-                i=$((i+1))
-            done
-            echo ""
-            info "Map active ports to device IPs."
-            info "Press Enter to skip a port."
-            echo ""
-            for port in $ACTIVE_PORTS; do
-                IP=$(ask "  Port $port → IP address (or Enter to skip):")
-                if [ -n "$IP" ]; then
-                    MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
-                    ok "Port $port mapped to $IP"
-                fi
-            done
-            ;;
+    info "Scanning switch ports for traffic..."
+    echo ""
+    printf "  %-8s %-20s %-20s %s\n" "Port" "RxGoodByte" "TxByte" "Status"
+    printf "  %-8s %-20s %-20s %s\n" "────" "──────────" "──────" "──────"
+    ACTIVE_PORTS=""
+    i=0
+    while [ $i -le 6 ]; do
+        MIB=$(swconfig dev "$SWITCH_DEV" port $i get mib 2>/dev/null)
+        # Debug: show raw MIB if empty
+        if [ -z "$MIB" ]; then
+            i=$((i+1))
+            continue
+        fi
+        # Try multiple field name variants across switch drivers
+        RX=$(echo "$MIB" | awk '
+            /[Rr]x[Gg]ood[Bb]yte|RxGoodByte|rx_good_bytes|RxGoodPkts/ {
+                for(i=1;i<=NF;i++) if($i+0==$i && $i>0) { print $i+0; exit }
+            }')
+        TX=$(echo "$MIB" | awk '
+            /[Tt]x[Bb]yte|TxByte|tx_bytes|TxGoodByte/ {
+                for(i=1;i<=NF;i++) if($i+0==$i && $i>0) { print $i+0; exit }
+            }')
+        RX=${RX:-0}
+        TX=${TX:-0}
+        if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
+            STATUS="active"
+            ACTIVE_PORTS="$ACTIVE_PORTS $i"
+        else
+            STATUS="idle"
+        fi
+        printf "  %-8s %-20s %-20s %s\n" "Port $i" "$RX" "$TX" "$STATUS"
+        i=$((i+1))
+    done
+
+    # Show raw MIB from port 0 so user can verify field names
+    echo ""
+    RAW=$(swconfig dev "$SWITCH_DEV" port 0 get mib 2>/dev/null | head -10)
+    if [ -n "$RAW" ]; then
+        info "Raw MIB sample (port 0, first 10 lines):"
+        echo "$RAW" | while IFS= read -r line; do
+            printf "    %s\n" "$line"
+        done
+        echo ""
+    fi
+
+    if [ -z "$(echo "$ACTIVE_PORTS" | tr -d ' ')" ]; then
+        warn "No active ports detected. Showing ALL ports for manual selection."
+        ACTIVE_PORTS="0 1 2 3 4"
+    fi
+
+    echo ""
+    info "Map ports to device IPs."
+    info "Press Enter to skip a port."
+    echo ""
+    for port in $ACTIVE_PORTS; do
+        IP=$(ask "  Port $port → IP address (or Enter to skip):")
+        if [ -n "$IP" ]; then
+            MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
+            ok "Port $port mapped to $IP"
+        fi
+    done
+;;
 
         dsa|ethtool)
             info "Scanning LAN interfaces for traffic..."
