@@ -4,7 +4,6 @@
 #  GitHub: https://github.com/Onimous-git/router-traffic-monitor
 # ═══════════════════════════════════════════════════════════════
 
-REPO="https://raw.githubusercontent.com/Onimous-git/router-traffic-monitor/main"
 CGI_PATH="/www/cgi-bin/traffic.cgi"
 NFT_PATH="/etc/nft-acct.nft"
 HOTPLUG_PATH="/etc/hotplug.d/iface/99-acct"
@@ -43,10 +42,8 @@ SWITCH_TYPE=""
 SWITCH_DEV=""
 DSA_PORTS=""
 LAN_IP=""
-LAN_SUBNET=""
-LAN_IFACE=""
+LAN_CIDR=""
 MODE=""
-OPENWRT_VERSION=""
 NFT_OK=0
 HYBRID_AVAILABLE=0
 MAPPED_PORTS=""
@@ -58,44 +55,38 @@ preflight_checks() {
     header "Router Traffic Monitor — Pre-flight Check"
     FAIL=0
 
-    # ── OpenWrt version ──────────────────────────────────────
     echo ""
     echo "  Checking OpenWrt version..."
     if [ -f /etc/openwrt_release ]; then
         . /etc/openwrt_release
-        OPENWRT_VERSION="$DISTRIB_RELEASE"
         MAJOR=$(echo "$DISTRIB_RELEASE" | cut -d. -f1)
         MINOR=$(echo "$DISTRIB_RELEASE" | cut -d. -f2 | cut -d- -f1)
         info "Detected  : OpenWrt $DISTRIB_RELEASE ($DISTRIB_ARCH)"
         info "Required  : $MIN_OPENWRT_MAJOR.$MIN_OPENWRT_MINOR or newer"
         if [ "$MAJOR" -gt "$MIN_OPENWRT_MAJOR" ] || \
-        { [ "$MAJOR" -eq "$MIN_OPENWRT_MAJOR" ] && [ "$MINOR" -ge "$MIN_OPENWRT_MINOR" ]; }; then
+           { [ "$MAJOR" -eq "$MIN_OPENWRT_MAJOR" ] && [ "$MINOR" -ge "$MIN_OPENWRT_MINOR" ]; }; then
             ok "Version OK"
         else
             fail "Version UNSUPPORTED"
-            echo ""
             warn "OpenWrt $DISTRIB_RELEASE uses iptables, not nftables."
             warn "WiFi auto-detection requires nftables (OpenWrt 21.02+)."
             echo ""
-            printf "  Options:\n"
             printf "    1) Exit and upgrade OpenWrt first (recommended)\n"
             printf "    2) Continue anyway (ethernet MIB only, no WiFi tracking)\n"
             printf "    3) Abort\n"
             echo ""
             CHOICE=$(ask "Your choice (1/2/3):")
             case "$CHOICE" in
-                1) echo ""; info "Please upgrade OpenWrt then re-run installer."; exit 0 ;;
+                1) info "Please upgrade OpenWrt then re-run installer."; exit 0 ;;
                 2) warn "Continuing with limited functionality..."; NFT_OK=0 ;;
-                3) exit 0 ;;
                 *) exit 0 ;;
             esac
         fi
     else
-        fail "Cannot detect OpenWrt version — /etc/openwrt_release missing"
+        fail "Cannot detect OpenWrt version"
         FAIL=1
     fi
 
-    # ── Flash space ──────────────────────────────────────────
     echo ""
     echo "  Checking flash space..."
     FLASH_KB=$(df /overlay 2>/dev/null | awk 'NR==2{print int($4/1)}')
@@ -104,17 +95,14 @@ preflight_checks() {
     if [ "${FLASH_KB:-0}" -ge "$MIN_FLASH_KB" ]; then
         ok "Flash OK"
     else
-        fail "Insufficient flash space"
-        warn "Only ${FLASH_KB}KB free, need ${MIN_FLASH_KB}KB minimum"
+        fail "Insufficient flash space — only ${FLASH_KB}KB free"
         FAIL=1
     fi
 
-    # ── RAM ─────────────────────────────────────────────────
     echo ""
     echo "  Checking RAM..."
     RAM_MB=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
     info "Available : ${RAM_MB} MB"
-    info "Required  : ${MIN_RAM_MB} MB minimum"
     if [ "${RAM_MB:-0}" -ge "$MIN_RAM_MB" ]; then
         ok "RAM OK"
     else
@@ -122,21 +110,12 @@ preflight_checks() {
         FAIL=1
     fi
 
-    # ── Architecture ─────────────────────────────────────────
-    echo ""
-    echo "  Checking architecture..."
-    ARCH=$(uname -m)
-    info "Detected  : $ARCH"
-    ok "Architecture noted"
-
     echo ""
     printf "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
-
     if [ "$FAIL" = "1" ]; then
         fail "One or more checks failed. Fix issues and re-run installer."
         exit 1
     fi
-
     ok "All pre-flight checks passed."
     echo ""
     CHOICE=$(ask "Continue with installation? (y/n):")
@@ -154,17 +133,14 @@ detect_switch() {
     if command -v swconfig >/dev/null 2>&1; then
         SWITCH_DEV=$(swconfig list 2>/dev/null | awk 'NR==1{print $1}')
         if [ -n "$SWITCH_DEV" ]; then
-            # Verify it actually responds
-            if swconfig dev "$SWITCH_DEV" help >/dev/null 2>&1; then
-                SWITCH_TYPE="swconfig"
-                ok "Switch type : swconfig ($SWITCH_DEV)"
-                HYBRID_AVAILABLE=1
-                return
-            fi
+            SWITCH_TYPE="swconfig"
+            ok "Switch type : swconfig ($SWITCH_DEV)"
+            HYBRID_AVAILABLE=1
+            return
         fi
     fi
 
-    # 2. DSA — find interfaces that are members of br-lan
+    # 2. DSA
     echo "  swconfig not found, checking for DSA..."
     DSA_PORTS=""
     for iface in /sys/class/net/*/; do
@@ -174,7 +150,7 @@ detect_switch() {
         esac
         if [ -f "$iface/statistics/rx_bytes" ]; then
             IN_BRIDGE=0
-            brctl show br-lan 2>/dev/null | grep -q "^[[:space:]]*$name" && IN_BRIDGE=1
+            brctl show br-lan 2>/dev/null | grep -q "$name" && IN_BRIDGE=1
             bridge link 2>/dev/null | grep -q " $name " && IN_BRIDGE=1
             if [ "$IN_BRIDGE" = "1" ]; then
                 DSA_PORTS="$DSA_PORTS $name"
@@ -235,20 +211,16 @@ check_deps() {
         CHOICE=$(ask "  Install $PKG now? (y/n):")
         if [ "$CHOICE" = "y" ] || [ "$CHOICE" = "Y" ]; then
             if [ "$OPKG_UPDATED" = "0" ]; then
-                echo ""
                 info "Running opkg update..."
                 opkg update >/dev/null 2>&1
                 OPKG_UPDATED=1
             fi
-            echo ""
             info "Installing $PKG..."
             if opkg install "$PKG" >/dev/null 2>&1; then
                 ok "$PKG installed successfully"
                 return 0
             else
                 fail "Failed to install $PKG"
-                echo ""
-                fail "Cannot continue without $PKG. Check internet connection and try again."
                 exit 1
             fi
         else
@@ -265,7 +237,6 @@ check_deps() {
         printf "${GREEN}installed${NC}\n"
     else
         printf "${RED}missing${NC}\n"
-        fail "awk not found — this is unusual for OpenWrt"
         install_pkg "gawk" "CGI data parsing"
     fi
 
@@ -276,8 +247,8 @@ check_deps() {
     if [ "$SWITCH_TYPE" = "dsa" ]; then
         printf "  Checking %-20s ... " "bridge"
         command -v bridge >/dev/null 2>&1 && \
-        printf "${GREEN}installed${NC}\n" || \
-        install_pkg "bridge-utils" "DSA interface detection"
+            printf "${GREEN}installed${NC}\n" || \
+            install_pkg "bridge-utils" "DSA interface detection"
     fi
 
     echo ""
@@ -293,7 +264,6 @@ detect_network() {
 
     LAN_IP=$(uci get network.lan.ipaddr 2>/dev/null)
     LAN_MASK=$(uci get network.lan.netmask 2>/dev/null)
-    LAN_DEV=$(uci get network.lan.device 2>/dev/null)
 
     IFS=. read -r i1 i2 i3 i4 << EOF
 $LAN_IP
@@ -319,7 +289,6 @@ EOF
 
     info "Router LAN IP : $LAN_IP"
     info "LAN Subnet    : $LAN_CIDR"
-    info "LAN Device    : $LAN_DEV"
     echo ""
     ok "Network detected"
 }
@@ -364,185 +333,130 @@ map_ports() {
 
     header "Ethernet Port Mapping"
     echo ""
-    info "Connected devices (from DHCP leases):"
-    echo ""
-    printf "  %-18s %-20s %s\n" "IP Address" "Hostname" "MAC"
-    printf "  %-18s %-20s %s\n" "──────────" "────────" "───"
-    while IFS= read -r line; do
-        MAC=$(echo "$line" | awk '{print $2}')
-        IP=$(echo "$line"  | awk '{print $3}')
-        HOST=$(echo "$line" | awk '{print $4}')
-        printf "  %-18s %-20s %s\n" "$IP" "$HOST" "$MAC"
-    done < /tmp/dhcp.leases
+
+    # Show connected devices
+    if [ -s /tmp/dhcp.leases ]; then
+        info "Connected devices (from DHCP leases):"
+        echo ""
+        printf "  %-18s %-20s %s\n" "IP Address" "Hostname" "MAC"
+        printf "  %-18s %-20s %s\n" "──────────" "────────" "───"
+        while IFS= read -r line; do
+            MAC=$(echo "$line"  | awk '{print $2}')
+            IP=$(echo "$line"   | awk '{print $3}')
+            HOST=$(echo "$line" | awk '{print $4}')
+            printf "  %-18s %-20s %s\n" "$IP" "$HOST" "$MAC"
+        done < /tmp/dhcp.leases
+    else
+        info "No DHCP leases found. Showing ARP table instead:"
+        echo ""
+        printf "  %-18s %s\n" "IP Address" "MAC"
+        printf "  %-18s %s\n" "──────────" "───"
+        awk 'NR>1 && $3=="0x2" && $7~/br-lan/ {printf "  %-18s %s\n", $1, $4}' /proc/net/arp
+    fi
     echo ""
 
     MAPPED_PORTS=""
 
     case "$SWITCH_TYPE" in
-
         swconfig)
-            info "Building ARP + DHCP maps..."
-            rm -f /tmp/_rtm_arp.txt /tmp/_rtm_dhcp.txt \
-                  /tmp/_rtm_arl.txt /tmp/_rtm_ports.txt \
-                  /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt
-
-            # MAC -> IP — scan all fields for MAC pattern (busybox arp -n
-            # puts MAC in col 4, standard puts it in col 3)
-            arp -n | awk '
-                /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {
-                    for(i=2;i<=NF;i++) {
-                        if($i~/^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/) {
-                            print tolower($i) " " $1
-                            break
-                        }
-                    }
-                }' > /tmp/_rtm_arp.txt
-
-            # MAC -> IP -> hostname from DHCP leases
-            # lease format: expiry MAC IP hostname ...
-            awk '{print tolower($2) " " $3 " " $4}' \
-                /tmp/dhcp.leases > /tmp/_rtm_dhcp.txt
-
-            info "Reading ARL table..."
-            swconfig dev "$SWITCH_DEV" get arl_table 2>/dev/null \
-                > /tmp/_rtm_arl.txt
-
-            # Parse port→MAC, skip CPU port 0
-            awk '
-                /^Port [0-9]+:/ {
-                    port=$2; gsub(":","",port)
-                    mac=tolower($4)
-                    if(port!="0" && mac!="") print port " " mac
-                }
-            ' /tmp/_rtm_arl.txt > /tmp/_rtm_ports.txt
-
+            info "Scanning ALL switch ports (including idle)..."
             echo ""
-            printf "  %-8s %-20s %-18s %-20s %-15s %s\n" \
-                "Port" "Hostname" "IP" "MAC" "RxGoodByte" "TxByte"
-            printf "  %-8s %-20s %-18s %-20s %-15s %s\n" \
-                "────" "────────" "──" "───" "──────────" "──────"
+            printf "  %-8s %-20s %-20s %s\n" "Port" "RxGoodByte" "TxByte" "Status"
+            printf "  %-8s %-20s %-20s %s\n" "────" "──────────" "──────" "──────"
 
-            # fd3 redirect avoids subshell — variables persist after loop
-            while IFS=' ' read -r port mac <&3; do
-                [ -z "$port" ] && continue
-
-                IP=$(awk   -v m="$mac" '$1==m{print $2;exit}' /tmp/_rtm_arp.txt)
-                HOST=$(awk -v m="$mac" '$1==m{print $3;exit}' /tmp/_rtm_dhcp.txt)
-                [ -z "$IP" ]   && IP="unknown"
-                [ -z "$HOST" ] && HOST="unknown"
-
-                MIB=$(swconfig dev "$SWITCH_DEV" port "$port" get mib 2>/dev/null)
-                RX=$(printf '%s\n' "$MIB" | awk '/^RxGoodByte/{print $3+0}')
-                TX=$(printf '%s\n' "$MIB" | awk '/^TxByte/{print $3+0}')
-                RX=${RX:-0}
-                TX=${TX:-0}
-
-                printf "  %-8s %-20s %-18s %-20s %-15s %s\n" \
-                    "Port $port" "$HOST" "$IP" "$mac" "$RX" "$TX"
-
-                printf '%s:%s:%s:%s\n' "$port" "$IP" "$HOST" "$mac" \
-                    >> /tmp/_rtm_portinfo.txt
-
-                if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
-                    printf '%s\n' "$port" >> /tmp/_rtm_active.txt
+            ALL_PORTS=""
+            i=0
+            while [ $i -le 6 ]; do
+                MIB=$(swconfig dev "$SWITCH_DEV" port $i get mib 2>/dev/null)
+                if [ -n "$MIB" ]; then
+                    RX=$(echo "$MIB" | awk '/RxGoodByte/{print $3+0}')
+                    TX=$(echo "$MIB" | awk '/TxByte/{print $3+0}')
+                    RX=${RX:-0}
+                    TX=${TX:-0}
+                    if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
+                        STATUS="active"
+                    else
+                        STATUS="idle"
+                    fi
+                    printf "  %-8s %-20s %-20s %s\n" "Port $i" "$RX" "$TX" "$STATUS"
+                    ALL_PORTS="$ALL_PORTS $i"
                 fi
+                i=$((i+1))
+            done
 
-            done 3< /tmp/_rtm_ports.txt
-
-            echo ""
-
-            PORT_INFO=$(grep -v '^$' /tmp/_rtm_portinfo.txt 2>/dev/null)
-            ACTIVE_PORTS=$(grep -v '^$' /tmp/_rtm_active.txt 2>/dev/null \
-                           | tr '\n' ' ')
-
-            rm -f /tmp/_rtm_arl.txt /tmp/_rtm_ports.txt \
-                  /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt \
-                  /tmp/_rtm_arp.txt /tmp/_rtm_dhcp.txt
-
-            if [ -z "$(echo "$ACTIVE_PORTS" | tr -d ' ')" ]; then
-                warn "No active ports — using all detected ports"
-                ACTIVE_PORTS=$(printf '%s\n' "$PORT_INFO" \
-                               | cut -d: -f1 | tr '\n' ' ')
+            if [ -z "$ALL_PORTS" ]; then
+                warn "No switch ports found. Check swconfig device name."
+                warn "Switching to Auto mode."
+                MODE="auto"
+                return
             fi
 
             echo ""
-            info "Map ports to device IPs."
-            info "Press Enter to confirm detected IP. Type new IP to override. 's' to skip."
+            info "Map ports to device IPs (Enter to skip a port)."
+            info "Tip: generate traffic on a device to identify its port."
             echo ""
 
-            for port in $ACTIVE_PORTS; do
-                PINFO=$(printf '%s\n' "$PORT_INFO" | grep "^${port}:")
-                D_IP=$(printf '%s\n'   "$PINFO" | cut -d: -f2)
-                D_HOST=$(printf '%s\n' "$PINFO" | cut -d: -f3)
-                D_MAC=$(printf '%s\n'  "$PINFO" | cut -d: -f4)
-
-                if [ -n "$D_IP" ] && [ "$D_IP" != "unknown" ]; then
-                    printf "  ${BOLD}Port $port${NC} → ${CYAN}%s${NC} (%s) [%s]\n" \
-                        "$D_IP" "$D_HOST" "$D_MAC"
-                    IP=$(ask "  Confirm (Enter=$D_IP, new IP, or 's' to skip):")
-                    case "$IP" in
-                        s|S) continue ;;
-                        "")  IP="$D_IP" ;;
-                    esac
+            for port in $ALL_PORTS; do
+                IP=$(ask "  Port $port → IP address (or Enter to skip):")
+                if [ -n "$IP" ]; then
+                    MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
+                    ok "Port $port mapped to $IP"
                 else
-                    printf "  ${BOLD}Port $port${NC} (%s) [%s] — IP not in ARP table\n" \
-                        "$D_HOST" "$D_MAC"
-                    IP=$(ask "  Enter IP manually (or 's'/Enter to skip):")
-                    case "$IP" in
-                        s|S|"") continue ;;
-                    esac
+                    info "Port $port skipped"
                 fi
-
-                MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
-                ok "Port $port → $IP"
             done
-        ;;
+            ;;
 
         dsa|ethtool)
-            info "Scanning LAN interfaces for traffic..."
+            info "Scanning LAN interfaces..."
             echo ""
-            printf "  %-12s %-20s %-20s %s\n" \
-                "Interface" "RX bytes" "TX bytes" "Status"
-            printf "  %-12s %-20s %-20s %s\n" \
-                "─────────" "────────" "────────" "──────"
-            ACTIVE_IFACES=""
+            printf "  %-12s %-20s %-20s %s\n" "Interface" "RX bytes" "TX bytes" "Status"
+            printf "  %-12s %-20s %-20s %s\n" "─────────" "────────" "────────" "──────"
+
             for iface in $DSA_PORTS; do
                 RX=$(cat /sys/class/net/$iface/statistics/rx_bytes 2>/dev/null || echo 0)
                 TX=$(cat /sys/class/net/$iface/statistics/tx_bytes 2>/dev/null || echo 0)
                 if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
                     STATUS="active"
-                    ACTIVE_IFACES="$ACTIVE_IFACES $iface"
                 else
                     STATUS="idle"
                 fi
-                printf "  %-12s %-20s %-20s %s\n" \
-                    "$iface" "$RX" "$TX" "$STATUS"
+                printf "  %-12s %-20s %-20s %s\n" "$iface" "$RX" "$TX" "$STATUS"
             done
+
             echo ""
-            info "Map active interfaces to device IPs."
-            info "Press Enter to skip an interface."
+            info "Map interfaces to device IPs (Enter to skip)."
             echo ""
-            for iface in $ACTIVE_IFACES; do
+
+            for iface in $DSA_PORTS; do
                 IP=$(ask "  $iface → IP address (or Enter to skip):")
                 if [ -n "$IP" ]; then
                     MAPPED_PORTS="$MAPPED_PORTS $iface:$IP"
                     ok "$iface mapped to $IP"
+                else
+                    info "$iface skipped"
                 fi
             done
-        ;;
-
+            ;;
     esac
 
     if [ -z "$MAPPED_PORTS" ]; then
-        warn "No ports mapped — switching to Auto mode"
-        MODE="auto"
+        echo ""
+        warn "No ports mapped."
+        CHOICE=$(ask "  Switch to Auto mode? (y/n):")
+        if [ "$CHOICE" = "y" ] || [ "$CHOICE" = "Y" ]; then
+            MODE="auto"
+            warn "Switching to Auto mode"
+        else
+            info "Re-run installer and map at least one port to use Hybrid mode."
+            exit 0
+        fi
     fi
 }
 
 # ══════════════════════════════════════════════════════════════
 #  STEP 7 — GENERATE & INSTALL FILES
 # ══════════════════════════════════════════════════════════════
-
 install_nft() {
     cat > "$NFT_PATH" << EOF
 table ip acct {
@@ -676,14 +590,14 @@ install_cgi_hybrid_swconfig() {
 
         SNAP1_CMDS="${SNAP1_CMDS}swconfig dev $SWITCH_DEV port $PORT get mib > \"\$T/${VAR}s1\" &\n"
         SNAP2_CMDS="${SNAP2_CMDS}swconfig dev $SWITCH_DEV port $PORT get mib > \"\$T/${VAR}s2\" &\n"
-        READ1_CMDS="${READ1_CMDS}${VAR}_PRXI=\$(awk '/^RxGoodByte/{print \$3+0}' \"\$T/${VAR}s1\")\n"
-        READ1_CMDS="${READ1_CMDS}${VAR}_PTXI=\$(awk '/^TxByte/{print \$3+0}'     \"\$T/${VAR}s1\")\n"
-        READ2_CMDS="${READ2_CMDS}${VAR}_PRXF=\$(awk '/^RxGoodByte/{print \$3+0}' \"\$T/${VAR}s2\")\n"
-        READ2_CMDS="${READ2_CMDS}${VAR}_PTXF=\$(awk '/^TxByte/{print \$3+0}'     \"\$T/${VAR}s2\")\n"
-        RATE_CMDS="${RATE_CMDS}${VAR}_RX=\$(( (\$\{${VAR}_PTXF\} - \$\{${VAR}_PTXI\}) * 100 / ELAPSED ))\n"
-        RATE_CMDS="${RATE_CMDS}${VAR}_TX=\$(( (\$\{${VAR}_PRXF\} - \$\{${VAR}_PRXI\}) * 100 / ELAPSED ))\n"
-        RATE_CMDS="${RATE_CMDS}[ \"\$\{${VAR}_RX\}\" -lt 0 ] && ${VAR}_RX=0\n"
-        RATE_CMDS="${RATE_CMDS}[ \"\$\{${VAR}_TX\}\" -lt 0 ] && ${VAR}_TX=0\n"
+        READ1_CMDS="${READ1_CMDS}${VAR}_PRXI=\$(awk '/RxGoodByte/{print \$3+0}' \"\$T/${VAR}s1\")\n"
+        READ1_CMDS="${READ1_CMDS}${VAR}_PTXI=\$(awk '/TxByte/{print \$3+0}'     \"\$T/${VAR}s1\")\n"
+        READ2_CMDS="${READ2_CMDS}${VAR}_PRXF=\$(awk '/RxGoodByte/{print \$3+0}' \"\$T/${VAR}s2\")\n"
+        READ2_CMDS="${READ2_CMDS}${VAR}_PTXF=\$(awk '/TxByte/{print \$3+0}'     \"\$T/${VAR}s2\")\n"
+        RATE_CMDS="${RATE_CMDS}${VAR}_RX=\$(( (\${${VAR}_PTXF} - \${${VAR}_PTXI}) * 100 / ELAPSED ))\n"
+        RATE_CMDS="${RATE_CMDS}${VAR}_TX=\$(( (\${${VAR}_PRXF} - \${${VAR}_PRXI}) * 100 / ELAPSED ))\n"
+        RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_RX}\" -lt 0 ] && ${VAR}_RX=0\n"
+        RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_TX}\" -lt 0 ] && ${VAR}_TX=0\n"
 
         if [ -z "$JSON_FIRST" ]; then
             JSON_FIRST="printf '{\"ip\":\"$IP\",\"rxRate\":%d,\"txRate\":%d}' \"\$${VAR}_RX\" \"\$${VAR}_TX\""
@@ -708,6 +622,7 @@ echo ""
 T=\$(mktemp -d)
 SNAP1=\$(mktemp)
 SNAP2=\$(mktemp)
+TOTAL_DEVICES=\$(wc -l < /tmp/dhcp.leases)
 
 # Snapshot 1
 $(printf "$SNAP1_CMDS")nft list table ip acct > "\$SNAP1" &
@@ -805,10 +720,10 @@ install_cgi_hybrid_dsa() {
         SNAP1_CMDS="${SNAP1_CMDS}${VAR}_TXI=\$(cat /sys/class/net/$IFACE/statistics/tx_bytes)\n"
         SNAP2_CMDS="${SNAP2_CMDS}${VAR}_RXF=\$(cat /sys/class/net/$IFACE/statistics/rx_bytes)\n"
         SNAP2_CMDS="${SNAP2_CMDS}${VAR}_TXF=\$(cat /sys/class/net/$IFACE/statistics/tx_bytes)\n"
-        RATE_CMDS="${RATE_CMDS}${VAR}_RX=\$(( (\$\{${VAR}_RXF\} - \$\{${VAR}_RXI\}) * 100 / ELAPSED ))\n"
-        RATE_CMDS="${RATE_CMDS}${VAR}_TX=\$(( (\$\{${VAR}_TXF\} - \$\{${VAR}_TXI\}) * 100 / ELAPSED ))\n"
-        RATE_CMDS="${RATE_CMDS}[ \"\$\{${VAR}_RX\}\" -lt 0 ] && ${VAR}_RX=0\n"
-        RATE_CMDS="${RATE_CMDS}[ \"\$\{${VAR}_TX\}\" -lt 0 ] && ${VAR}_TX=0\n"
+        RATE_CMDS="${RATE_CMDS}${VAR}_RX=\$(( (\${${VAR}_RXF} - \${${VAR}_RXI}) * 100 / ELAPSED ))\n"
+        RATE_CMDS="${RATE_CMDS}${VAR}_TX=\$(( (\${${VAR}_TXF} - \${${VAR}_TXI}) * 100 / ELAPSED ))\n"
+        RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_RX}\" -lt 0 ] && ${VAR}_RX=0\n"
+        RATE_CMDS="${RATE_CMDS}[ \"\${${VAR}_TX}\" -lt 0 ] && ${VAR}_TX=0\n"
 
         if [ -z "$JSON_FIRST" ]; then
             JSON_FIRST="printf '{\"ip\":\"$IP\",\"rxRate\":%d,\"txRate\":%d}' \"\$${VAR}_RX\" \"\$${VAR}_TX\""
@@ -911,7 +826,6 @@ CGEOF
 install_files() {
     header "Installing Files"
     echo ""
-
     install_nft
     install_hotplug
 
@@ -922,7 +836,7 @@ install_files() {
                 swconfig)    install_cgi_hybrid_swconfig ;;
                 dsa|ethtool) install_cgi_hybrid_dsa ;;
             esac
-        ;;
+            ;;
     esac
 
     echo ""
@@ -936,7 +850,7 @@ install_files() {
     fi
 
     echo ""
-    info "Verifying firewall4 masquerade intact..."
+    info "Verifying firewall masquerade intact..."
     if nft list ruleset | grep -q "masquerade"; then
         ok "Masquerade OK — internet will work after reboot"
     else
@@ -980,7 +894,7 @@ print_esp32_config() {
     echo ""
     printf "${BOLD}  After flashing:${NC}\n"
     printf "  1) Connect ESP32 to your router WiFi\n"
-    printf "  2) Find ESP32 IP from router DHCP leases: cat /tmp/dhcp.leases\n"
+    printf "  2) Find ESP32 IP: cat /tmp/dhcp.leases\n"
     printf "  3) Open http://<ESP32-IP> in browser\n"
     printf "  4) Set endpoint URL and device names\n"
     echo ""
