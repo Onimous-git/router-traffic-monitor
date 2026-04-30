@@ -400,7 +400,8 @@ map_ports() {
                         STATUS="active"
                         ACTIVE_PORTS="$ACTIVE_PORTS $i"
                     else
-                        STATUS="idle"
+                        STATUS="idle (0 traffic)"
+                        ACTIVE_PORTS="$ACTIVE_PORTS $i"
                     fi
                     printf "  %-8s %-20s %-20s %s\n" "Port $i" "$RX" "$TX" "$STATUS"
                 fi
