@@ -385,66 +385,101 @@ map_ports() {
     case "$SWITCH_TYPE" in
 
         swconfig)
-    info "Scanning switch ports for traffic..."
+    info "Scanning switch ports via ARL table + MIB..."
     echo ""
-    printf "  %-8s %-20s %-20s %s\n" "Port" "RxGoodByte" "TxByte" "Status"
-    printf "  %-8s %-20s %-20s %s\n" "────" "──────────" "──────" "──────"
+
+    # Build MAC→IP and MAC→hostname maps
+    arp -n 2>/dev/null | awk '/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/{
+        mac=tolower($3)
+        if(mac!="" && mac!="<incomplete>") print mac " " $1
+    }' > /tmp/_rtm_arp.txt
+
+    awk '{print tolower($2) " " $3 " " $4}' /tmp/dhcp.leases \
+        > /tmp/_rtm_dhcp.txt
+
+    # Parse ARL table → port:MAC list (skip CPU port 0)
+    ARL=$(swconfig dev "$SWITCH_DEV" get arl_table 2>/dev/null)
+    PORT_MAC_LIST=$(echo "$ARL" | awk '
+        /^Port [0-9]+:/ {
+            port=$2; gsub(":","",port)
+            mac=tolower($4)
+            if(port!="0") print port " " mac
+        }')
+
+    echo ""
+    printf "  %-8s %-18s %-20s %-20s %-20s %s\n" \
+        "Port" "MAC" "IP" "Hostname" "RxGoodByte" "TxByte"
+    printf "  %-8s %-18s %-20s %-20s %-20s %s\n" \
+        "────" "───" "──" "────────" "──────────" "──────"
+
     ACTIVE_PORTS=""
-    i=0
-    while [ $i -le 6 ]; do
-        MIB=$(swconfig dev "$SWITCH_DEV" port $i get mib 2>/dev/null)
-        # Debug: show raw MIB if empty
-        if [ -z "$MIB" ]; then
-            i=$((i+1))
-            continue
-        fi
-        # Try multiple field name variants across switch drivers
-        RX=$(echo "$MIB" | awk '
-            /[Rr]x[Gg]ood[Bb]yte|RxGoodByte|rx_good_bytes|RxGoodPkts/ {
-                for(i=1;i<=NF;i++) if($i+0==$i && $i>0) { print $i+0; exit }
-            }')
-        TX=$(echo "$MIB" | awk '
-            /[Tt]x[Bb]yte|TxByte|tx_bytes|TxGoodByte/ {
-                for(i=1;i<=NF;i++) if($i+0==$i && $i>0) { print $i+0; exit }
-            }')
-        RX=${RX:-0}
-        TX=${TX:-0}
+    PORT_INFO=""
+
+    echo "$PORT_MAC_LIST" | while IFS=' ' read -r port mac; do
+        [ -z "$port" ] && continue
+
+        # Lookup IP and hostname
+        IP=$(awk -v m="$mac" '$1==m{print $2}' /tmp/_rtm_arp.txt)
+        HOST=$(awk -v m="$mac" '$1==m{print $3}' /tmp/_rtm_dhcp.txt)
+        [ -z "$IP" ]   && IP="unknown"
+        [ -z "$HOST" ] && HOST="unknown"
+
+        # Get MIB counters
+        MIB=$(swconfig dev "$SWITCH_DEV" port "$port" get mib 2>/dev/null)
+        RX=$(echo "$MIB" | awk '/^RxGoodByte/{print $3+0}')
+        TX=$(echo "$MIB" | awk '/^TxByte/{print $3+0}')
+        RX=${RX:-0}; TX=${TX:-0}
+
+        printf "  %-8s %-18s %-20s %-20s %-20s %s\n" \
+            "Port $port" "$mac" "$IP" "$HOST" "$RX" "$TX"
+
+        # Write to temp file since we're in a subshell
+        echo "$port:$IP:$HOST:$mac" >> /tmp/_rtm_portinfo.txt
         if [ "$RX" -gt 0 ] || [ "$TX" -gt 0 ]; then
-            STATUS="active"
-            ACTIVE_PORTS="$ACTIVE_PORTS $i"
-        else
-            STATUS="idle"
+            echo "$port" >> /tmp/_rtm_active.txt
         fi
-        printf "  %-8s %-20s %-20s %s\n" "Port $i" "$RX" "$TX" "$STATUS"
-        i=$((i+1))
     done
 
-    # Show raw MIB from port 0 so user can verify field names
     echo ""
-    RAW=$(swconfig dev "$SWITCH_DEV" port 0 get mib 2>/dev/null | head -10)
-    if [ -n "$RAW" ]; then
-        info "Raw MIB sample (port 0, first 10 lines):"
-        echo "$RAW" | while IFS= read -r line; do
-            printf "    %s\n" "$line"
-        done
-        echo ""
-    fi
+
+    # Read back from temp files (subshell workaround)
+    PORT_INFO=$(cat /tmp/_rtm_portinfo.txt 2>/dev/null)
+    ACTIVE_PORTS=$(cat /tmp/_rtm_active.txt 2>/dev/null | tr '\n' ' ')
+    rm -f /tmp/_rtm_portinfo.txt /tmp/_rtm_active.txt
 
     if [ -z "$(echo "$ACTIVE_PORTS" | tr -d ' ')" ]; then
-        warn "No active ports detected. Showing ALL ports for manual selection."
-        ACTIVE_PORTS="0 1 2 3 4"
+        warn "No active ports found — using all detected ports"
+        ACTIVE_PORTS=$(echo "$PORT_INFO" | cut -d: -f1 | tr '\n' ' ')
     fi
 
-    echo ""
     info "Map ports to device IPs."
-    info "Press Enter to skip a port."
+    info "Press Enter to confirm detected IP, or type a new one. Enter 's' to skip."
     echo ""
+
     for port in $ACTIVE_PORTS; do
-        IP=$(ask "  Port $port → IP address (or Enter to skip):")
-        if [ -n "$IP" ]; then
-            MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
-            ok "Port $port mapped to $IP"
+        PINFO=$(echo "$PORT_INFO" | grep "^$port:")
+        DETECTED_IP=$(echo "$PINFO"   | cut -d: -f2)
+        DETECTED_HOST=$(echo "$PINFO" | cut -d: -f3)
+        DETECTED_MAC=$(echo "$PINFO"  | cut -d: -f4)
+
+        if [ "$DETECTED_IP" != "unknown" ] && [ -n "$DETECTED_IP" ]; then
+            printf "  ${BOLD}Port $port${NC} → ${CYAN}$DETECTED_IP${NC}"
+            printf " %-20s [%s]\n" "($DETECTED_HOST)" "$DETECTED_MAC"
+            IP=$(ask "  Confirm IP (Enter=$DETECTED_IP, or type new, 's'=skip):")
+            case "$IP" in
+                s|S) continue ;;
+                "")  IP="$DETECTED_IP" ;;
+            esac
+        else
+            printf "  ${BOLD}Port $port${NC} — no device resolved\n"
+            IP=$(ask "  Port $port → IP address ('s' or Enter to skip):")
+            case "$IP" in
+                s|S|"") continue ;;
+            esac
         fi
+
+        MAPPED_PORTS="$MAPPED_PORTS $port:$IP"
+        ok "Port $port → $IP"
     done
 ;;
 
